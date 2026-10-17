@@ -10,6 +10,16 @@ const MOUSE_SYNC_BIT: u8 = 1 << 3;
 const MOUSE_OVERFLOW_X: u8 = 1 << 6;
 const MOUSE_OVERFLOW_Y: u8 = 1 << 7;
 const POLL_LIMIT: usize = 100_000;
+/// Per-axis pointer tolerance for treating two presses as the same location.
+///
+/// NOTE: Open-source Contribution Area: tune only alongside icon hit testing.
+const DOUBLE_CLICK_DISTANCE: usize = 8;
+
+/// Maximum elapsed PIT ticks between a matching pair of pointer clicks.
+///
+/// NOTE: Open-source Contribution Area: tune this interval with desktop input
+/// testing and keep it consistent with the shell's 100 Hz timer.
+pub const DOUBLE_CLICK_TICKS: u32 = 45;
 
 static MOUSE_X: AtomicI32 = AtomicI32::new(0);
 static MOUSE_Y: AtomicI32 = AtomicI32::new(0);
@@ -29,6 +39,49 @@ pub struct MouseState {
     pub y: usize,
     pub buttons: u8,
     pub left_pressed_at: Option<u32>,
+}
+
+/// Tracks two nearby pointer presses and safely handles PIT counter rollover.
+///
+/// NOTE: Open-source Contribution Area: add per-device timing and movement
+/// policies when multiple pointer devices are supported.
+#[derive(Default)]
+pub struct DoubleClickTracker {
+    previous: Option<(usize, usize, u32)>,
+}
+
+impl DoubleClickTracker {
+    /// Records a press and reports whether it matches the preceding click.
+    ///
+    /// Coordinates may move by at most [`DOUBLE_CLICK_DISTANCE`] pixels on
+    /// either axis; callers still verify that both hits identify the same UI
+    /// element before dispatching an action.
+    ///
+    /// NOTE: Open-source Contribution Area: update the spatial tolerance only
+    /// alongside matching hit-test semantics.
+    pub fn register_press(&mut self, x: usize, y: usize, tick: u32) -> bool {
+        let is_double = self
+            .previous
+            .is_some_and(|(previous_x, previous_y, previous_tick)| {
+                x.abs_diff(previous_x) <= DOUBLE_CLICK_DISTANCE
+                    && y.abs_diff(previous_y) <= DOUBLE_CLICK_DISTANCE
+                    && tick.wrapping_sub(previous_tick) <= DOUBLE_CLICK_TICKS
+            });
+        if is_double {
+            self.previous = None;
+        } else {
+            self.previous = Some((x, y, tick));
+        }
+        is_double
+    }
+
+    /// Discards pending click history when a press is outside a target.
+    ///
+    /// NOTE: Open-source Contribution Area: preserve explicit reset behavior
+    /// if press tracking later becomes shared between multiple widgets.
+    pub fn clear(&mut self) {
+        self.previous = None;
+    }
 }
 
 /// Enables the PS/2 auxiliary device and bounds pointer coordinates to a screen.
@@ -264,7 +317,10 @@ unsafe fn write_port(port: u16, value: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{process_packet, record_left_press, take_left_press, BUTTONS, LEFT_PRESS_PENDING};
+    use super::{
+        process_packet, record_left_press, take_left_press, DoubleClickTracker, BUTTONS,
+        LEFT_PRESS_PENDING,
+    };
     use core::sync::atomic::Ordering;
 
     #[test]
@@ -298,5 +354,16 @@ mod tests {
         process_packet(0, 0, 0);
 
         assert_eq!(take_left_press(), None);
+    }
+
+    #[test]
+    /// Verifies location, timing, and wrapping behavior for click pairs.
+    fn double_click_tracker_checks_location_time_and_tick_wrap() {
+        let mut tracker = DoubleClickTracker::default();
+        assert!(!tracker.register_press(10, 20, u32::MAX - 10));
+        assert!(tracker.register_press(14, 24, 10));
+        assert!(!tracker.register_press(10, 20, 30));
+        assert!(!tracker.register_press(40, 20, 31));
+        assert!(!tracker.register_press(40, 20, 80));
     }
 }

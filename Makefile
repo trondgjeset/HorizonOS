@@ -6,6 +6,7 @@ RUST_LIBRARY := $(BUILD_DIR)/libhorizon_kernel.a
 BOOT_OBJECT := $(BUILD_DIR)/boot.o
 RUNTIME_OBJECT := $(BUILD_DIR)/runtime.o
 PE_FIXTURE := $(BUILD_DIR)/hello-fixture.exe
+WALLPAPER_FIXTURE := $(BUILD_DIR)/wallpaper.bmp
 INITRD := $(BUILD_DIR)/initrd.img
 ISO := $(BUILD_DIR)/horizon-os.iso
 
@@ -17,7 +18,7 @@ QEMU ?= qemu-system-i386
 QEMU_DISPLAY ?= gtk
 
 # Building the ISO is deliberately separate from launching the emulator.
-.PHONY: all build kernel iso run test test-pe test-clock test-keyboard test-mouse test-heap test-filesystem clean
+.PHONY: all build kernel iso run test test-pe test-clock test-keyboard test-mouse test-heap test-filesystem test-graphics test-ui-icons test-win32 test-win32-loader test-win32-file-api clean
 
 all: build
 
@@ -35,7 +36,7 @@ $(RUNTIME_OBJECT): src/runtime.c | $(BUILD_DIR)
 	$(CC) -m32 -ffreestanding -fno-builtin -fno-stack-protector -c $< -o $@
 
 # Compile the no_std Rust kernel as a static library for the i686 target.
-$(RUST_LIBRARY): src/lib.rs src/memory.rs src/heap.rs src/pe.rs src/graphics.rs src/mouse.rs src/window_manager.rs src/clock.rs src/font8x8.rs src/keyboard.rs src/scheduler.rs src/filesystem.rs | $(BUILD_DIR)
+$(RUST_LIBRARY): src/lib.rs src/memory.rs src/heap.rs src/pe.rs src/graphics.rs src/graphics/bmp.rs src/mouse.rs src/window_manager.rs src/clock.rs src/font8x8.rs src/keyboard.rs src/scheduler.rs src/filesystem.rs src/ui/mod.rs src/ui/icons.rs src/win32/mod.rs src/win32/gdi.rs src/win32/file_api.rs src/win32/pipeline.rs src/win32/loader.rs | $(BUILD_DIR)
 	$(RUSTC) --edition=2021 --target i686-unknown-linux-gnu \
 		--crate-name horizon_kernel --crate-type staticlib \
 		-C panic=abort -C opt-level=2 -C relocation-model=static \
@@ -58,8 +59,11 @@ $(ISO_ROOT)/boot/grub/grub.cfg: iso/boot/grub/grub.cfg
 $(PE_FIXTURE): tools/gen_pe_fixture.py | $(BUILD_DIR)
 	python3 $< $@
 
-$(INITRD): tools/gen_initrd.py | $(BUILD_DIR)
+$(WALLPAPER_FIXTURE): tools/gen_wallpaper.py | $(BUILD_DIR)
 	python3 $< $@
+
+$(INITRD): tools/gen_initrd.py $(PE_FIXTURE) $(WALLPAPER_FIXTURE) | $(BUILD_DIR)
+	python3 $< $@ $(PE_FIXTURE) $(WALLPAPER_FIXTURE)
 
 $(ISO_ROOT)/boot/hello-fixture.exe: $(PE_FIXTURE)
 	mkdir -p $(dir $@)
@@ -103,7 +107,29 @@ test-filesystem: | $(BUILD_DIR)
 	$(RUSTC) --edition=2021 --test src/filesystem.rs -o $(BUILD_DIR)/filesystem-tests
 	$(BUILD_DIR)/filesystem-tests
 
-test: test-pe test-clock test-keyboard test-mouse test-heap test-filesystem
+test-graphics: | $(BUILD_DIR)
+	$(RUSTC) --edition=2021 --test tests/graphics.rs -o $(BUILD_DIR)/graphics-tests
+	$(BUILD_DIR)/graphics-tests
+
+test-ui-icons: | $(BUILD_DIR)
+	$(RUSTC) --edition=2021 --test tests/ui_icons.rs -o $(BUILD_DIR)/ui-icons-tests
+	$(BUILD_DIR)/ui-icons-tests
+
+test-win32: | $(BUILD_DIR)
+	$(RUSTC) --edition=2021 --test src/win32/gdi.rs -o $(BUILD_DIR)/win32-gdi-tests
+	$(BUILD_DIR)/win32-gdi-tests
+	$(RUSTC) --edition=2021 --test src/win32/pipeline.rs -o $(BUILD_DIR)/win32-pipeline-tests
+	$(BUILD_DIR)/win32-pipeline-tests
+
+test-win32-loader: | $(BUILD_DIR)
+	$(RUSTC) --edition=2021 --test tests/win32_loader.rs -o $(BUILD_DIR)/win32-loader-tests
+	$(BUILD_DIR)/win32-loader-tests
+
+test-win32-file-api: | $(BUILD_DIR)
+	$(RUSTC) --edition=2021 --test tests/win32_file_api.rs -o $(BUILD_DIR)/win32-file-api-tests
+	$(BUILD_DIR)/win32-file-api-tests
+
+test: test-pe test-clock test-keyboard test-mouse test-heap test-filesystem test-graphics test-ui-icons test-win32 test-win32-loader test-win32-file-api
 
 clean:
 	rm -rf build

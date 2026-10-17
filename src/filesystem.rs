@@ -1,4 +1,10 @@
+extern crate alloc;
+
+use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
 use core::ptr::read_unaligned;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const TAR_BLOCK_SIZE: usize = 512;
 // TODO: Optimization Opportunity: replace the fixed index with heap-backed
@@ -6,6 +12,9 @@ const TAR_BLOCK_SIZE: usize = 512;
 const MAX_ENTRIES: usize = 48;
 const PATH_CAPACITY: usize = 120;
 const DISPLAY_PATH_CAPACITY: usize = PATH_CAPACITY + 3;
+const MAX_WRITABLE_FILE_SIZE: usize = 1024 * 1024;
+const MAX_OVERLAY_FILES: usize = 32;
+const MAX_OVERLAY_BYTES: usize = 2 * 1024 * 1024;
 const MULTIBOOT_BOOTLOADER_MAGIC: u32 = 0x2bad_b002;
 const MULTIBOOT_INFO_MODULES: u32 = 1 << 3;
 #[cfg(test)]
@@ -50,6 +59,116 @@ pub struct Archive<'a> {
 }
 
 static mut ARCHIVE: Option<Archive<'static>> = None;
+
+/// One mutable file stored in the volatile overlay above the immutable initrd.
+struct WritableEntry {
+    path: [u8; PATH_CAPACITY],
+    path_length: usize,
+    contents: Vec<u8>,
+}
+
+/// Heap-backed mutable overlay; base archive entries remain immutable.
+struct WritableOverlay {
+    entries: Vec<WritableEntry>,
+    used_bytes: usize,
+}
+
+impl WritableOverlay {
+    /// Creates an empty overlay without allocating until a write is committed.
+    ///
+    /// NOTE: Open-source Contribution Area: reserve a bounded initial index
+    /// only after measuring boot-time heap availability.
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            used_bytes: 0,
+        }
+    }
+}
+
+/// Serializes overlay reads and writes while preserving allocator access.
+struct OverlayLock {
+    locked: AtomicBool,
+    overlay: UnsafeCell<WritableOverlay>,
+}
+
+// SAFETY: all access to `overlay` is protected by the atomic lock and its guard.
+unsafe impl Sync for OverlayLock {}
+
+impl OverlayLock {
+    /// Constructs a statically initialized overlay lock.
+    ///
+    /// NOTE: Open-source Contribution Area: use the kernel's shared
+    /// synchronization primitive if one is introduced for filesystem state.
+    const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            overlay: UnsafeCell::new(WritableOverlay::new()),
+        }
+    }
+
+    /// Disables local interrupts and serializes access to the overlay.
+    ///
+    /// NOTE: Open-source Contribution Area: add lock-rank checking if the
+    /// kernel grows additional nested filesystem and storage locks.
+    fn lock(&self) -> OverlayGuard<'_> {
+        let interrupt_state = disable_interrupts();
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        OverlayGuard {
+            lock: self,
+            interrupt_state,
+        }
+    }
+}
+
+/// RAII guard for the writable overlay's protected state.
+struct OverlayGuard<'a> {
+    lock: &'a OverlayLock,
+    interrupt_state: usize,
+}
+
+impl Deref for OverlayGuard<'_> {
+    type Target = WritableOverlay;
+
+    /// Borrows the overlay while the associated spin lock is held.
+    ///
+    /// NOTE: Open-source Contribution Area: keep guard borrowing exclusive to
+    /// the lifetime of the acquired lock.
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: this guard owns the lock until Drop.
+        unsafe { &*self.lock.overlay.get() }
+    }
+}
+
+impl DerefMut for OverlayGuard<'_> {
+    /// Borrows the overlay mutably while the associated spin lock is held.
+    ///
+    /// NOTE: Open-source Contribution Area: audit this unsafe access if lock
+    /// ownership or scheduler preemption semantics change.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: this guard exclusively owns the lock until Drop.
+        unsafe { &mut *self.lock.overlay.get() }
+    }
+}
+
+impl Drop for OverlayGuard<'_> {
+    /// Releases the lock before restoring the prior interrupt state.
+    ///
+    /// NOTE: Open-source Contribution Area: preserve release ordering and
+    /// interrupt restoration when adapting this guard to other architectures.
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+        restore_interrupts(self.interrupt_state);
+    }
+}
+
+static WRITABLE_OVERLAY: OverlayLock = OverlayLock::new();
 
 #[repr(C)]
 /// Multiboot fields needed to find the loaded initrd module.
@@ -142,22 +261,70 @@ pub fn initialize(bytes: &'static [u8]) -> Result<(), &'static str> {
 }
 
 /// Returns the number of indexed paths, including the synthetic drive root.
+///
+/// NOTE: Open-source Contribution Area: add indexed directory snapshots if
+/// File Explorer needs stable pagination during concurrent writes.
 pub fn entry_count() -> Result<usize, &'static str> {
-    with_archive(|archive| archive.entry_count + 1)
+    let overlay = WRITABLE_OVERLAY.lock();
+    with_archive(|archive| {
+        let additional = overlay
+            .entries
+            .iter()
+            .filter(|entry| {
+                !archive.entries[..archive.entry_count].iter().any(|base| {
+                    base.path_length == entry.path_length
+                        && base.path[..base.path_length]
+                            .eq_ignore_ascii_case(&entry.path[..entry.path_length])
+                })
+            })
+            .count();
+        archive.entry_count + additional + 1
+    })
 }
 
 /// Returns directory entry `index`, or `None` when it is beyond the index.
 ///
 /// Index zero is the synthetic `C:\` root. Errors are returned if the archive
 /// has not been initialized.
+///
+/// NOTE: Open-source Contribution Area: expose a generation-tagged snapshot
+/// when directory pagination must remain stable during writes.
 pub fn entry_at(index: usize) -> Result<Option<EntryInfo>, &'static str> {
+    let overlay = WRITABLE_OVERLAY.lock();
     with_archive(|archive| {
         if index == 0 {
             return Some(root_entry());
         }
-        archive.entries[..archive.entry_count]
-            .get(index - 1)
-            .map(|entry| display_entry(entry))
+        let mut visible_index = 1usize;
+        for base in &archive.entries[..archive.entry_count] {
+            let replacement = overlay.entries.iter().find(|entry| {
+                entry.path_length == base.path_length
+                    && entry.path[..entry.path_length]
+                        .eq_ignore_ascii_case(&base.path[..base.path_length])
+            });
+            let info = replacement
+                .map(display_writable_entry)
+                .unwrap_or_else(|| display_entry(base));
+            if visible_index == index {
+                return Some(info);
+            }
+            visible_index += 1;
+        }
+        for entry in &overlay.entries {
+            let exists_in_base = archive.entries[..archive.entry_count].iter().any(|base| {
+                base.path_length == entry.path_length
+                    && base.path[..base.path_length]
+                        .eq_ignore_ascii_case(&entry.path[..entry.path_length])
+            });
+            if exists_in_base {
+                continue;
+            }
+            if visible_index == index {
+                return Some(display_writable_entry(entry));
+            }
+            visible_index += 1;
+        }
+        None
     })
 }
 
@@ -165,8 +332,19 @@ pub fn entry_at(index: usize) -> Result<Option<EntryInfo>, &'static str> {
 ///
 /// Accepts either slash style below `C:\`. Returns an error for invalid paths,
 /// an uninitialized archive, or a path that does not exist.
+///
+/// NOTE: Open-source Contribution Area: add mount-aware canonicalization and
+/// explicit case policy as further filesystems are introduced.
 pub fn resolve_windows_path(path: &str) -> Result<EntryInfo, &'static str> {
     let normalized = normalize_windows_path(path)?;
+    let overlay = WRITABLE_OVERLAY.lock();
+    if let Some(entry) = overlay.entries.iter().find(|entry| {
+        entry.path_length == normalized.length
+            && entry.path[..entry.path_length]
+                .eq_ignore_ascii_case(&normalized.bytes[..normalized.length])
+    }) {
+        return Ok(display_writable_entry(entry));
+    }
     with_archive(|archive| {
         if normalized.length == 0 {
             return Some(root_entry());
@@ -188,8 +366,25 @@ pub fn resolve_windows_path(path: &str) -> Result<EntryInfo, &'static str> {
 /// `path` must name a file on `C:\`; directories are rejected. Returns an
 /// error if the path is invalid or missing, the destination is too small, or
 /// the archive is not initialized.
+///
+/// NOTE: Open-source Contribution Area: add consistency guarantees for
+/// multi-block files once a persistent backend exists.
 pub fn read_file(path: &str, destination: &mut [u8]) -> Result<usize, &'static str> {
     let normalized = normalize_windows_path(path)?;
+    {
+        let overlay = WRITABLE_OVERLAY.lock();
+        if let Some(entry) = overlay.entries.iter().find(|entry| {
+            entry.path_length == normalized.length
+                && entry.path[..entry.path_length]
+                    .eq_ignore_ascii_case(&normalized.bytes[..normalized.length])
+        }) {
+            if destination.len() < entry.contents.len() {
+                return Err("destination buffer is too small for the file");
+            }
+            destination[..entry.contents.len()].copy_from_slice(&entry.contents);
+            return Ok(entry.contents.len());
+        }
+    }
     with_archive(|archive| {
         let entry = archive.entries[..archive.entry_count]
             .iter()
@@ -210,6 +405,86 @@ pub fn read_file(path: &str, destination: &mut [u8]) -> Result<usize, &'static s
         destination[..entry.size].copy_from_slice(&archive.bytes[entry.data_offset..end]);
         Ok(entry.size)
     })?
+}
+
+/// Atomically creates or replaces a regular file in the volatile C: overlay.
+///
+/// The read-only initrd remains untouched: writes are copied into heap-owned
+/// overlay storage and become visible to subsequent VFS reads/listings. The
+/// parent directory must already exist, directories cannot be replaced, and
+/// overlay file/count/aggregate-byte limits are checked before committing.
+///
+/// # Errors
+/// Returns an error for invalid/traversal paths, missing parent directories,
+/// allocation or quota exhaustion, oversized files, and write attempts to a
+/// directory. On failure, existing file contents and overlay metadata remain
+/// unchanged.
+///
+/// NOTE: Open-source Contribution Area: replace the volatile overlay with a
+/// journaled storage backend only after block-device flush and recovery
+/// semantics are implemented and tested.
+pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
+    let normalized = normalize_windows_path(path)?;
+    if normalized.length == 0 {
+        return Err("cannot write the C:\\ drive root");
+    }
+    if data.len() > MAX_WRITABLE_FILE_SIZE {
+        return Err("file exceeds the writable overlay file-size limit");
+    }
+    validate_writable_parent(&normalized)?;
+    if let Some(existing) = archive_entry(&normalized)? {
+        if existing.is_directory {
+            return Err("cannot replace a directory with a file");
+        }
+    }
+
+    // Allocate and copy the payload before taking the overlay lock. A failed
+    // allocation therefore cannot partially replace a previously saved file.
+    let mut contents = Vec::new();
+    contents
+        .try_reserve_exact(data.len())
+        .map_err(|_| "not enough heap memory for file contents")?;
+    contents.extend_from_slice(data);
+
+    let mut overlay = WRITABLE_OVERLAY.lock();
+    let existing_index = overlay.entries.iter().position(|entry| {
+        entry.path_length == normalized.length
+            && entry.path[..entry.path_length]
+                .eq_ignore_ascii_case(&normalized.bytes[..normalized.length])
+    });
+    let previous_size = existing_index
+        .map(|index| overlay.entries[index].contents.len())
+        .unwrap_or(0);
+    let next_total = overlay
+        .used_bytes
+        .checked_sub(previous_size)
+        .and_then(|used| used.checked_add(contents.len()))
+        .ok_or("writable overlay byte count overflow")?;
+    if next_total > MAX_OVERLAY_BYTES {
+        return Err("writable overlay exceeds its total byte limit");
+    }
+
+    if let Some(index) = existing_index {
+        overlay.entries[index].contents = contents;
+        overlay.used_bytes = next_total;
+        return Ok(());
+    }
+    if overlay.entries.len() >= MAX_OVERLAY_FILES {
+        return Err("writable overlay contains too many files");
+    }
+    overlay
+        .entries
+        .try_reserve(1)
+        .map_err(|_| "not enough heap memory for the writable file index")?;
+    let mut stored_path = [0u8; PATH_CAPACITY];
+    stored_path[..normalized.length].copy_from_slice(&normalized.bytes[..normalized.length]);
+    overlay.entries.push(WritableEntry {
+        path: stored_path,
+        path_length: normalized.length,
+        contents,
+    });
+    overlay.used_bytes = next_total;
+    Ok(())
 }
 
 impl<'a> Archive<'a> {
@@ -344,6 +619,118 @@ fn with_archive<R>(operation: impl FnOnce(&Archive<'static>) -> R) -> Result<R, 
             .ok_or("C:\\ virtual drive is not initialized")
     }
 }
+
+/// Finds a normalized path in the immutable boot archive.
+///
+/// The returned metadata borrows no archive memory, so callers may safely
+/// release any overlay lock before copying file payload bytes.
+///
+/// NOTE: Open-source Contribution Area: centralize VFS lookup across archive
+/// and future mounted backends as the storage model grows.
+fn archive_entry(path: &VecPath) -> Result<Option<EntryInfo>, &'static str> {
+    with_archive(|archive| {
+        archive.entries[..archive.entry_count]
+            .iter()
+            .find(|entry| {
+                entry.path_length == path.length
+                    && entry.path[..entry.path_length]
+                        .eq_ignore_ascii_case(&path.bytes[..path.length])
+            })
+            .map(display_entry)
+    })
+}
+
+/// Rejects writes unless the normalized path's parent is an indexed directory.
+///
+/// The current overlay creates files only; it deliberately does not synthesize
+/// arbitrary directories or permit path traversal into a future mount.
+///
+/// NOTE: Open-source Contribution Area: add directory creation and mount-aware
+/// parent resolution only with corresponding authorization and rollback rules.
+fn validate_writable_parent(path: &VecPath) -> Result<(), &'static str> {
+    let parent_length = path.bytes[..path.length]
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .unwrap_or(0);
+    if parent_length == 0 {
+        return Ok(());
+    }
+    let parent = VecPath {
+        bytes: path.bytes,
+        length: parent_length,
+    };
+    match archive_entry(&parent)? {
+        Some(entry) if entry.is_directory => Ok(()),
+        Some(_) => Err("parent path is not a directory"),
+        None => Err("parent directory does not exist"),
+    }
+}
+
+/// Creates display metadata for one overlay entry without exposing its payload.
+///
+/// NOTE: Open-source Contribution Area: share path-display conversion between
+/// archive, overlay, and future persistent storage backends.
+fn display_writable_entry(entry: &WritableEntry) -> EntryInfo {
+    let mut info = root_entry();
+    info.path[3..3 + entry.path_length].copy_from_slice(&entry.path[..entry.path_length]);
+    for byte in &mut info.path[3..3 + entry.path_length] {
+        if *byte == b'/' {
+            *byte = b'\\';
+        }
+    }
+    info.path_length = 3 + entry.path_length;
+    info.size = entry.contents.len();
+    info.is_directory = false;
+    info
+}
+
+/// Captures x86 EFLAGS and disables local interrupts before locking the overlay.
+///
+/// NOTE: Open-source Contribution Area: preserve architecture-specific
+/// interrupt state when porting the kernel beyond x86.
+#[cfg(all(not(test), target_arch = "x86"))]
+fn disable_interrupts() -> usize {
+    let flags: usize;
+    unsafe {
+        core::arch::asm!(
+            "pushfd",
+            "pop {flags:e}",
+            "cli",
+            flags = out(reg) flags,
+            options(nomem, nostack)
+        );
+    }
+    flags
+}
+
+/// Supplies the test/non-x86 interrupt-state placeholder for overlay locking.
+///
+/// NOTE: Open-source Contribution Area: replace this placeholder if tests or
+/// production builds are moved to another interrupt architecture.
+#[cfg(any(test, not(target_arch = "x86")))]
+fn disable_interrupts() -> usize {
+    0
+}
+
+/// Restores the caller's x86 interrupt-enable state after releasing the lock.
+///
+/// NOTE: Open-source Contribution Area: pair this with the architecture's
+/// preemption-control rules if the scheduler gains SMP support.
+#[cfg(all(not(test), target_arch = "x86"))]
+fn restore_interrupts(flags: usize) {
+    if flags & (1 << 9) != 0 {
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+    }
+}
+
+/// Supplies the test/non-x86 restore placeholder for overlay locking.
+///
+/// NOTE: Open-source Contribution Area: implement the matching architecture
+/// restore path alongside `disable_interrupts` when needed.
+#[cfg(any(test, not(target_arch = "x86")))]
+fn restore_interrupts(_flags: usize) {}
 
 fn root_entry() -> EntryInfo {
     let mut root = EntryInfo {
@@ -573,8 +960,17 @@ fn validate_checksum(header: &[u8]) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Archive, MAX_ENTRIES, TAR_BLOCK_SIZE};
+    use super::{
+        entry_at, entry_count, initialize, read_file, resolve_windows_path, write_file, Archive,
+        MAX_ENTRIES, TAR_BLOCK_SIZE,
+    };
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
 
+    /// Builds one checksum-correct ustar record for filesystem regression tests.
+    ///
+    /// NOTE: Open-source Contribution Area: add reusable archive fixtures for
+    /// nested and malformed paths as more VFS behavior is covered.
     fn header(name: &[u8], data: &[u8], kind: u8) -> Vec<u8> {
         let mut block = [0u8; TAR_BLOCK_SIZE];
         block[..name.len()].copy_from_slice(name);
@@ -602,6 +998,46 @@ mod tests {
             );
         }
         archive
+    }
+
+    /// Verifies overlay create, replace, read, listing, and failure atomicity.
+    ///
+    /// NOTE: Open-source Contribution Area: add quota-boundary and concurrent
+    /// writer tests as the overlay policy and scheduler evolve.
+    #[test]
+    fn writes_overlay_files_without_mutating_archive_entries() {
+        let mut bytes = header(b"Docs/", b"", b'5');
+        bytes.extend_from_slice(&header(b"Docs/BASE.TXT", b"base bytes", b'0'));
+        bytes.extend_from_slice(&[0; TAR_BLOCK_SIZE * 2]);
+        let archive: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        initialize(archive).unwrap();
+
+        assert_eq!(
+            resolve_windows_path(r"C:\Docs\BASE.TXT").unwrap().size,
+            b"base bytes".len()
+        );
+        write_file(r"C:\Docs\notes.txt", b"first draft").unwrap();
+        let created = resolve_windows_path(r"c:/docs/NOTES.TXT").unwrap();
+        assert_eq!(created.size, b"first draft".len());
+        assert!(!created.is_directory);
+
+        let mut output = [0u8; 32];
+        let length = read_file(r"C:\Docs\notes.txt", &mut output).unwrap();
+        assert_eq!(&output[..length], b"first draft");
+        let count_after_create = entry_count().unwrap();
+        assert_eq!(count_after_create, 4);
+        assert!((0..count_after_create)
+            .filter_map(|index| entry_at(index).unwrap())
+            .any(|entry| &entry.path[..entry.path_length] == b"C:\\docs\\notes.txt"));
+
+        write_file(r"C:\Docs\BASE.TXT", b"replacement").unwrap();
+        let length = read_file(r"C:\Docs\BASE.TXT", &mut output).unwrap();
+        assert_eq!(&output[..length], b"replacement");
+        assert_eq!(entry_count().unwrap(), count_after_create);
+
+        assert!(write_file(r"C:\Missing\bad.txt", b"bad").is_err());
+        let length = read_file(r"C:\Docs\BASE.TXT", &mut output).unwrap();
+        assert_eq!(&output[..length], b"replacement");
     }
 
     #[test]

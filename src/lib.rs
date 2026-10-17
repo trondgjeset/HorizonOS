@@ -17,6 +17,8 @@ mod memory;
 mod mouse;
 mod pe;
 mod scheduler;
+mod ui;
+pub mod win32;
 mod window_manager;
 
 use core::mem::MaybeUninit;
@@ -246,6 +248,39 @@ pub extern "C" fn rust_kernel_main(boot_magic: u32, multiboot_info_address: u32)
             halt_forever();
         }
     };
+    let wallpaper_result = (|| {
+        // The boot archive is immutable; retain an owned, size-bounded byte
+        // copy in the window manager so each redraw can safely decode it.
+        // NOTE: Contribution Area: route wallpaper selection through a
+        // settings-controlled VFS path after user preferences are implemented.
+        let entry = filesystem::resolve_windows_path(r"C:\Windows\System\wallpaper.bmp")?;
+        if entry.is_directory {
+            return Err("desktop wallpaper path resolves to a directory");
+        }
+        if entry.size > graphics::bmp::MAX_WALLPAPER_BYTES {
+            return Err("desktop wallpaper exceeds the decoder size limit");
+        }
+        let mut bytes = alloc::vec::Vec::new();
+        bytes
+            .try_reserve_exact(entry.size)
+            .map_err(|_| "not enough heap memory to load the desktop wallpaper")?;
+        bytes.resize(entry.size, 0);
+        let bytes_read = filesystem::read_file(r"C:\Windows\System\wallpaper.bmp", &mut bytes)?;
+        if bytes_read != entry.size {
+            return Err("desktop wallpaper size changed while reading");
+        }
+        window_manager.set_wallpaper(bytes)
+    })();
+    match wallpaper_result {
+        Ok(()) => {
+            debug_write_str("desktop wallpaper loaded from C:\\Windows\\System\\wallpaper.bmp\n")
+        }
+        Err(message) => {
+            debug_write_str("Wallpaper load failed; using the slate background: ");
+            debug_write_str(message);
+            debug_write_str("\n");
+        }
+    }
     let initial_clock = clock::read_datetime();
     if let Err(message) = initial_clock {
         debug_write_str("RTC unavailable: ");
@@ -300,16 +335,41 @@ pub extern "C" fn rust_kernel_main(boot_magic: u32, multiboot_info_address: u32)
         debug_write_str("\n");
         halt_forever();
     }
-    debug_write_str("PIT scheduler ready at 100 Hz; launching desktop and isolated calculator\n");
+    debug_write_str(
+        "PIT scheduler ready at 100 Hz; launching desktop with Ring 3 calculator blocked\n",
+    );
     scheduler::start()
 }
 
+/// Wakes the pre-created Ring 3 calculator after a utility-launch action succeeds.
+///
+/// The scheduler prepared the isolated address space and context during boot,
+/// but keeps the task blocked until this action-routing point.
+///
+/// NOTE: Action Routing: invoke only after the utility window is visible; report
+/// scheduler failures rather than disguising them as a successful launch.
+fn wake_utility_calculator() {
+    match scheduler::wake_calculator() {
+        Ok(()) => debug_write_str("Ring 3 calculator task queued by System Utility\n"),
+        Err(message) => {
+            debug_write_str("Ring 3 calculator task could not be queued: ");
+            debug_write_str(message);
+            debug_write_str("\n");
+        }
+    }
+}
+
+/// Runs desktop events and routes typed UI actions to kernel-owned operations.
+///
+/// NOTE: Action Routing: preserve the UI/scheduler boundary here; Start Menu
+/// hit testing returns an enum and never manipulates scheduler state directly.
 extern "C" fn desktop_task() -> ! {
     let manager =
         unsafe { &mut *addr_of_mut!(WINDOW_MANAGER).cast::<window_manager::WindowManager>() };
     let multiboot_info_address = unsafe { read_volatile(addr_of!(BOOT_INFO_ADDRESS)) };
     let mut displayed_second = clock::seconds();
     let mut displayed_calculation_update = clock::ticks() / 10;
+    let mut displayed_caret_phase = clock::ticks() / window_manager::CARET_BLINK_TICKS;
     loop {
         let mut redraw = false;
         if mouse::take_dirty() {
@@ -318,11 +378,90 @@ extern "C" fn desktop_task() -> ! {
             match manager.handle_mouse(state) {
                 Ok(Some(window_manager::UiAction::RunSamplePe)) => {
                     debug_write_str("Run Sample PE selected\n");
-                    manager.show_pe_result(parse_pe_module(multiboot_info_address));
+                    match manager.show_pe_result(parse_pe_module(multiboot_info_address)) {
+                        Ok(()) => wake_utility_calculator(),
+                        Err(message) => {
+                            debug_write_str("System Utility could not open: ");
+                            debug_write_str(message);
+                            debug_write_str("\n");
+                        }
+                    }
+                }
+                Ok(Some(window_manager::UiAction::RunWin32Demo)) => {
+                    debug_write_str("Run Win32 Demo selected\n");
+                    // NOTE: This is a native kernel smoke test, not a guest
+                    // process request; no untrusted user pointer is forwarded.
+                    if let Err(message) = manager.show_win32_demo() {
+                        debug_write_str("Win32 GDI demo could not open: ");
+                        debug_write_str(message);
+                        debug_write_str("\n");
+                    }
+                }
+                Ok(Some(window_manager::UiAction::LaunchExternalApp)) => {
+                    debug_write_str("External PE staging requested: C:\\Apps\\TEST.EXE\n");
+                    // NOTE: This stages an untrusted file in kernel-owned,
+                    // non-executable memory only; the fixed scheduler and VMM
+                    // cannot create a separate dynamic process address space.
+                    match manager.show_pe_result(
+                        win32::loader::load_from_vfs(r"C:\Apps\TEST.EXE")
+                            .map(|image| image.summary()),
+                    ) {
+                        Ok(()) => wake_utility_calculator(),
+                        Err(message) => {
+                            debug_write_str("System Utility could not open: ");
+                            debug_write_str(message);
+                            debug_write_str("\n");
+                        }
+                    }
+                }
+                // NOTE: Action Routing: window allocation succeeds before the
+                // scheduler releases the isolated calculator context.
+                Ok(Some(window_manager::UiAction::ShowSystemUtility)) => {
+                    debug_write_str("System Utility selected\n");
+                    match manager.show_scratchpad() {
+                        Ok(()) => wake_utility_calculator(),
+                        Err(message) => {
+                            debug_write_str("System Utility could not open: ");
+                            debug_write_str(message);
+                            debug_write_str("\n");
+                        }
+                    }
+                }
+                Ok(Some(window_manager::UiAction::SaveEditorFile)) => {
+                    debug_write_str("Native Save File intent granted\n");
+                    if let Err(message) = manager.save_editor_file() {
+                        debug_write_str("Save File failed: ");
+                        debug_write_str(message);
+                        debug_write_str("\n");
+                    }
                 }
                 Ok(Some(window_manager::UiAction::OpenTextFile(entry))) => {
                     if let Err(message) = manager.show_text_file(entry) {
                         debug_write_str("Text Viewer could not open file: ");
+                        debug_write_str(message);
+                        debug_write_str("\n");
+                    }
+                }
+                Ok(Some(window_manager::UiAction::OpenThisPC)) => {
+                    debug_write_str("This PC desktop shortcut opened\n");
+                    if let Err(message) = manager.show_this_pc() {
+                        debug_write_str("This PC window could not open: ");
+                        debug_write_str(message);
+                        debug_write_str("\n");
+                    }
+                }
+                Ok(Some(window_manager::UiAction::OpenUserFolder)) => {
+                    debug_write_str("User Folder desktop shortcut opened\n");
+                    if let Err(message) = manager.show_user_folder() {
+                        debug_write_str("User Documents folder could not open: ");
+                        debug_write_str(message);
+                        debug_write_str("\n");
+                    }
+                }
+                Ok(Some(window_manager::UiAction::OpenRecycleBin)) => {
+                    debug_write_str("Recycle Bin desktop shortcut opened\n");
+                    if let Err(message) = manager.show_recycle_bin() {
+                        debug_write_str("Recycle Bin folder could not open: ");
                         debug_write_str(message);
                         debug_write_str("\n");
                     }
@@ -353,11 +492,17 @@ extern "C" fn desktop_task() -> ! {
         }
 
         let tick = clock::ticks();
+        // IRQ1 only queues ASCII. This task applies String mutations and
+        // repaints the caret on alternating tick windows while the field is focused.
+        let caret_phase = tick / window_manager::CARET_BLINK_TICKS;
+        if caret_phase != displayed_caret_phase {
+            displayed_caret_phase = caret_phase;
+            redraw |= manager.input_caret_focused();
+        }
         let calculation_update = tick / 10;
         if calculation_update != displayed_calculation_update {
             displayed_calculation_update = calculation_update;
-            manager.update_background_counter(memory::user_calculation_count());
-            redraw = true;
+            redraw |= manager.update_background_counter(memory::user_calculation_count());
         }
 
         let current_second = clock::seconds();
@@ -392,6 +537,8 @@ extern "C" fn desktop_task() -> ! {
         }
         if mouse::has_pending_event()
             || keyboard::has_pending_input()
+            || (manager.input_caret_focused()
+                && clock::ticks() / window_manager::CARET_BLINK_TICKS != displayed_caret_phase)
             || clock::seconds() != displayed_second
         {
             unsafe {
@@ -652,6 +799,14 @@ pub extern "C" fn rust_unexpected_interrupt_handler() -> ! {
     }
 }
 
+/// Updates modifier state or queues one translated printable/control key.
+///
+/// `scan_code` is one byte read from the PS/2 controller in the IRQ1 handler.
+/// This routine never allocates or mutates a window string; the desktop task
+/// consumes the bounded queue after interrupt return.
+///
+/// NOTE: Contribution Area: add extended scan-code state and keyboard-layout
+/// tables here without moving dynamic allocation into interrupt context.
 fn handle_scan_code(scan_code: u8) {
     let released = scan_code & 0x80 != 0;
     let key = scan_code & 0x7f;

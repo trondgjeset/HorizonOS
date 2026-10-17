@@ -3,6 +3,9 @@
 pub struct PeImage<'a> {
     bytes: &'a [u8],
     section_table_offset: usize,
+    optional_header_offset: usize,
+    optional_header_size: usize,
+    headers_size: usize,
     pub entry_point_rva: u32,
     pub image_base: u32,
     pub image_size: u32,
@@ -35,6 +38,115 @@ impl PeImage<'_> {
     /// Returns the number of section headers validated by the parser.
     pub fn section_count(&self) -> usize {
         self.section_count
+    }
+
+    /// Returns PE data-directory entry `index`, when it is present.
+    ///
+    /// The pair contains a virtual address and byte size. An absent directory
+    /// is `None`; malformed optional-header bounds are also treated as absent
+    /// here because `parse_pe32` validates the header extent before creating
+    /// the image view.
+    ///
+    /// NOTE: Open-source Contribution Area: add named directory constants and
+    /// format-specific validation as additional PE directory types are used.
+    pub fn data_directory(&self, index: usize) -> Option<(u32, u32)> {
+        if self.optional_header_size < 96 {
+            return None;
+        }
+        let count_offset = self.optional_header_offset.checked_add(92)?;
+        let count = read_u32(self.bytes, count_offset).ok()? as usize;
+        if index >= count {
+            return None;
+        }
+        let entry_offset = self
+            .optional_header_offset
+            .checked_add(96)?
+            .checked_add(index.checked_mul(8)?)?;
+        let entry_end = entry_offset.checked_add(8)?;
+        if entry_end
+            > self
+                .optional_header_offset
+                .checked_add(self.optional_header_size)?
+        {
+            return None;
+        }
+        Some((
+            read_u32(self.bytes, entry_offset).ok()?,
+            read_u32(self.bytes, entry_offset + 4).ok()?,
+        ))
+    }
+
+    /// Returns a file-backed byte range for an RVA wholly within headers or one section.
+    ///
+    /// This deliberately refuses ranges that cross PE mapping regions or refer
+    /// to zero-filled virtual tails, which prevents import parsing from reading
+    /// unrelated raw file bytes by treating an RVA as a file offset.
+    ///
+    /// NOTE: Open-source Contribution Area: support checked ranges spanning
+    /// adjacent mapped sections if a future PE directory format requires them.
+    pub fn read_rva(&self, rva: u32, length: usize) -> Option<&[u8]> {
+        let end_rva = (rva as usize).checked_add(length)?;
+        if end_rva <= self.headers_size {
+            return self.bytes.get(rva as usize..end_rva);
+        }
+        for index in 0..self.section_count {
+            let section = self.section(index)?;
+            let section_start = section.virtual_address as usize;
+            let raw_end_rva = section_start.checked_add(section.raw_size as usize)?;
+            if rva as usize >= section_start && end_rva <= raw_end_rva {
+                let raw_offset =
+                    (section.raw_offset as usize).checked_add(rva as usize - section_start)?;
+                return self.bytes.get(raw_offset..raw_offset.checked_add(length)?);
+            }
+        }
+        None
+    }
+
+    /// Copies PE headers and section bytes into an image-sized, zero-filled buffer.
+    ///
+    /// Section data is placed at its RVA and virtual-only tails remain zero.
+    /// The destination is a staging buffer, not a page mapping and must never
+    /// be executed directly by the kernel or treated as a Ring 3 image.
+    ///
+    /// NOTE: Open-source Contribution Area: add validated relocations and
+    /// per-section page permissions before connecting this staging format to
+    /// the virtual-memory manager.
+    pub fn materialize(&self, destination: &mut [u8]) -> Result<(), &'static str> {
+        if destination.len() < self.image_size as usize {
+            return Err("PE staging buffer is smaller than SizeOfImage");
+        }
+        let headers = self
+            .bytes
+            .get(..self.headers_size)
+            .ok_or("PE headers exceed the source file")?;
+        destination[..self.image_size as usize].fill(0);
+        destination[..self.headers_size].copy_from_slice(headers);
+
+        for index in 0..self.section_count {
+            let section = self
+                .section(index)
+                .ok_or("invalid PE section during materialization")?;
+            if section.raw_size == 0 {
+                continue;
+            }
+            let source_start = section.raw_offset as usize;
+            let source_end = source_start
+                .checked_add(section.raw_size as usize)
+                .ok_or("PE section source range overflow")?;
+            let source = self
+                .bytes
+                .get(source_start..source_end)
+                .ok_or("PE section source range exceeds file")?;
+            let destination_start = section.virtual_address as usize;
+            let destination_end = destination_start
+                .checked_add(section.raw_size as usize)
+                .ok_or("PE section destination range overflow")?;
+            let target = destination
+                .get_mut(destination_start..destination_end)
+                .ok_or("PE section destination range exceeds image")?;
+            target.copy_from_slice(source);
+        }
+        Ok(())
     }
 
     /// Decodes section `index`, or returns `None` if its header is unavailable.
@@ -84,6 +196,9 @@ impl PeImage<'_> {
 /// Returns a borrowed image view on success, or an error for malformed,
 /// truncated, unsupported, or out-of-range headers. This validates metadata
 /// only; it does not map sections or execute the image.
+///
+/// NOTE: Open-source Contribution Area: expand validation as optional-header
+/// directories and loader features are implemented.
 pub fn parse_pe32(bytes: &[u8]) -> Result<PeImage<'_>, &'static str> {
     if read_u16(bytes, 0)? != 0x5a4d {
         return Err("missing DOS MZ signature");
@@ -115,6 +230,12 @@ pub fn parse_pe32(bytes: &[u8]) -> Result<PeImage<'_>, &'static str> {
     if optional_size < 64 || read_u16(optional_header, 0)? != 0x010b {
         return Err("unsupported or truncated PE32 optional header");
     }
+    if optional_size >= 96 {
+        let directory_count = read_u32(optional_header, 92)? as usize;
+        if directory_count > (optional_size - 96) / 8 {
+            return Err("PE data-directory count exceeds the optional header");
+        }
+    }
 
     let entry_point_rva = read_u32(optional_header, 16)?;
     let image_base = read_u32(optional_header, 28)?;
@@ -135,6 +256,9 @@ pub fn parse_pe32(bytes: &[u8]) -> Result<PeImage<'_>, &'static str> {
     if headers_size > bytes.len() {
         return Err("PE headers exceed file size");
     }
+    if headers_size > image_size as usize {
+        return Err("PE headers exceed the declared image size");
+    }
 
     // COFF SizeOfOptionalHeader determines where section headers begin; using
     // it avoids assuming a fixed Optional Header length.
@@ -152,6 +276,9 @@ pub fn parse_pe32(bytes: &[u8]) -> Result<PeImage<'_>, &'static str> {
     let image = PeImage {
         bytes,
         section_table_offset,
+        optional_header_offset: optional,
+        optional_header_size: optional_size,
+        headers_size,
         entry_point_rva,
         image_base,
         image_size,
@@ -167,6 +294,21 @@ pub fn parse_pe32(bytes: &[u8]) -> Result<PeImage<'_>, &'static str> {
             .ok_or("section virtual address overflow")?;
         if section_end > image_size {
             return Err("section lies outside the image");
+        }
+        if section.virtual_address < headers_size as u32 {
+            return Err("section overlaps the PE headers");
+        }
+        for earlier_index in 0..index {
+            let earlier = image
+                .section(earlier_index)
+                .ok_or("invalid earlier PE section header")?;
+            let earlier_end = earlier
+                .virtual_address
+                .checked_add(earlier.virtual_size.max(earlier.raw_size))
+                .ok_or("earlier section virtual address overflow")?;
+            if section.virtual_address < earlier_end && earlier.virtual_address < section_end {
+                return Err("PE sections overlap in virtual memory");
+            }
         }
 
         if section.raw_size != 0 {

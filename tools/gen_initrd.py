@@ -7,6 +7,9 @@ import tarfile
 
 
 def add_directory(archive: tarfile.TarFile, path: str) -> None:
+    """Add one deterministic directory entry to the read-only C: archive."""
+    # NOTE: Open-source Contribution Area: preserve deterministic metadata if
+    # the archive format or directory permissions are extended.
     entry = tarfile.TarInfo(path)
     entry.type = tarfile.DIRTYPE
     entry.mode = 0o755
@@ -19,6 +22,9 @@ def add_directory(archive: tarfile.TarFile, path: str) -> None:
 
 
 def add_file(archive: tarfile.TarFile, path: str, content: bytes) -> None:
+    """Add a deterministic regular file, preserving the supplied bytes exactly."""
+    # NOTE: Open-source Contribution Area: keep writes in the runtime overlay;
+    # this generator should continue to produce an immutable base image.
     entry = tarfile.TarInfo(path)
     entry.type = tarfile.REGTYPE
     entry.mode = 0o644
@@ -31,9 +37,23 @@ def add_file(archive: tarfile.TarFile, path: str, content: bytes) -> None:
     archive.addfile(entry, io.BytesIO(content))
 
 
-def main(output: str) -> None:
+def main(output: str, executable_fixture: str, wallpaper_fixture: str) -> None:
+    """Build the VFS archive with PE and BMP fixtures under C:\\."""
+    # NOTE: Open-source Contribution Area: keep generated executable fixtures
+    # non-runnable until Horizon implements an isolated PE process loader.
     with tarfile.open(output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        for path in ("Documents/", "Apps/", "System/", "Users/", "Users/Guest/"):
+        for path in (
+            "Documents/",
+            "Apps/",
+            "System/",
+            "System/Trash/",
+            "Windows/",
+            "Windows/System/",
+            "Users/",
+            "Users/Guest/",
+            "Users/Default/",
+            "Users/Default/Documents/",
+        ):
             add_directory(archive, path)
         add_file(
             archive,
@@ -50,6 +70,10 @@ def main(output: str) -> None:
             "Apps/ABOUT.TXT",
             b"Applications are isolated by default.\n",
         )
+        with open(executable_fixture, "rb") as fixture:
+            add_file(archive, "Apps/TEST.EXE", fixture.read())
+        with open(wallpaper_fixture, "rb") as fixture:
+            add_file(archive, "Windows/System/wallpaper.bmp", fixture.read())
         add_file(
             archive,
             "System/INFO.TXT",
@@ -63,6 +87,6 @@ def main(output: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        raise SystemExit(f"usage: {sys.argv[0]} OUTPUT")
-    main(sys.argv[1])
+    if len(sys.argv) != 4:
+        raise SystemExit(f"usage: {sys.argv[0]} OUTPUT PE_FIXTURE WALLPAPER_FIXTURE")
+    main(sys.argv[1], sys.argv[2], sys.argv[3])

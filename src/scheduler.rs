@@ -2,6 +2,10 @@ use crate::memory::UserAddressSpace;
 use core::ptr::{addr_of_mut, write_volatile};
 
 const THREAD_COUNT: usize = 2;
+/// Fixed scheduler slot assigned to the desktop executive.
+const DESKTOP_THREAD_INDEX: usize = 0;
+/// Fixed isolated slot assigned to the deferred calculator worker.
+const CALCULATOR_THREAD_INDEX: usize = 1;
 const KERNEL_STACK_SIZE: usize = 16 * 1024;
 const KERNEL_CODE_SELECTOR: u32 = 0x08;
 const KERNEL_DATA_SELECTOR: u32 = 0x10;
@@ -89,8 +93,12 @@ extern "C" {
 ///
 /// `kernel_page_directory` is the supervisor address-space root, `user_space`
 /// supplies the calculator's directory and initial user stack, and
-/// `desktop_entry` is the desktop task's kernel entry point. Returns an error
-/// when any required context address is invalid.
+/// `desktop_entry` is the desktop task's kernel entry point. The calculator
+/// context is prepared but starts blocked until the System Utility is launched.
+/// Returns an error when any required context address is invalid.
+///
+/// NOTE: Action Routing: keep the pre-created user context blocked until the
+/// desktop action explicitly marks it ready for a Ring 3 time slice.
 pub fn initialize(
     kernel_page_directory: u32,
     user_space: UserAddressSpace,
@@ -118,23 +126,24 @@ pub fn initialize(
         for index in 0..THREAD_COUNT {
             let stack_top = (stacks.add(index) as u32) + KERNEL_STACK_SIZE as u32;
             let context = contexts.add(index);
-            let (entry, page_directory, user_stack, code_selector, state) = if index == 0 {
-                (
-                    desktop_entry,
-                    kernel_page_directory,
-                    None,
-                    KERNEL_CODE_SELECTOR,
-                    ThreadState::Running,
-                )
-            } else {
-                (
-                    crate::memory::USER_CODE_VIRTUAL_BASE as u32,
-                    user_space.page_directory,
-                    Some(user_space.initial_stack_pointer),
-                    USER_CODE_SELECTOR,
-                    ThreadState::Ready,
-                )
-            };
+            let (entry, page_directory, user_stack, code_selector, state) =
+                if index == DESKTOP_THREAD_INDEX {
+                    (
+                        desktop_entry,
+                        kernel_page_directory,
+                        None,
+                        KERNEL_CODE_SELECTOR,
+                        ThreadState::Running,
+                    )
+                } else {
+                    (
+                        crate::memory::USER_CODE_VIRTUAL_BASE as u32,
+                        user_space.page_directory,
+                        Some(user_space.initial_stack_pointer),
+                        USER_CODE_SELECTOR,
+                        ThreadState::Blocked,
+                    )
+                };
             let initial_stack = build_initial_context(stack_top, entry, code_selector, user_stack);
             write_volatile(addr_of_mut!((*context).saved_stack_pointer), initial_stack);
             write_volatile(
@@ -148,11 +157,43 @@ pub fn initialize(
                 },
             );
         }
-        CURRENT_THREAD = 0;
+        CURRENT_THREAD = DESKTOP_THREAD_INDEX;
         CURRENT_FPU_STATE = fpu_states as u32;
         INITIALIZED = true;
     }
     Ok(())
+}
+
+/// Queues the pre-created isolated calculator task for scheduling.
+///
+/// This does not allocate a new task: the fixed scheduler prepares its Ring 3
+/// context during boot, leaves it blocked, and transitions it to `Ready` only
+/// after the System Utility launcher action is handled. Repeated calls are
+/// idempotent.
+///
+/// Returns an error if the scheduler has not been initialized.
+///
+/// NOTE: Action Routing: call this only after the on-demand utility window has
+/// been successfully created, so failed launches do not start hidden work.
+pub fn wake_calculator() -> Result<(), &'static str> {
+    let interrupt_flags = disable_interrupts();
+    let result = unsafe {
+        if !INITIALIZED {
+            Err("calculator task requested before scheduler initialization")
+        } else {
+            let thread = addr_of_mut!(THREADS)
+                .cast::<ThreadControlBlock>()
+                .add(CALCULATOR_THREAD_INDEX);
+            if (*thread).state == ThreadState::Blocked {
+                // NOTE: Action Routing: only the explicit UI request makes
+                // this isolated calculator context eligible for a time slice.
+                write_volatile(addr_of_mut!((*thread).state), ThreadState::Ready);
+            }
+            Ok(())
+        }
+    };
+    restore_interrupts(interrupt_flags);
+    result
 }
 
 /// Enters the first scheduled task and does not return.
@@ -232,6 +273,35 @@ pub fn on_timer_interrupt(saved_stack_pointer: u32) -> u32 {
             );
         }
         (*next_thread.context_state).saved_stack_pointer
+    }
+}
+
+/// Captures EFLAGS and disables local interrupts while scheduler state changes.
+///
+/// NOTE: Action Routing: preserve interrupt state to avoid racing timer-based
+/// task selection while a desktop action wakes the calculator.
+fn disable_interrupts() -> u32 {
+    let flags: u32;
+    unsafe {
+        core::arch::asm!(
+            "pushfd",
+            "pop {flags:e}",
+            "cli",
+            flags = out(reg) flags
+        );
+    }
+    flags
+}
+
+/// Restores only the previously enabled interrupt state after a scheduler update.
+///
+/// NOTE: Action Routing: do not unconditionally enable interrupts when the
+/// caller entered with them disabled.
+fn restore_interrupts(flags: u32) {
+    if flags & INTERRUPTS_ENABLED_EFLAGS & (1 << 9) != 0 {
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
     }
 }
 

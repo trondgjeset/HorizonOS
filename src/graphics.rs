@@ -2,9 +2,102 @@ use core::ptr::{copy_nonoverlapping, read_unaligned};
 
 use crate::font8x8::FONT8X8_BASIC;
 
+/// Safe decoder and framebuffer blitter for uncompressed Windows bitmaps.
+///
+/// NOTE: Contribution Area: expand supported formats only with strict
+/// dimension, compression, and allocation bounds.
+#[path = "graphics/bmp.rs"]
+pub mod bmp;
+
 const MULTIBOOT_INFO_FRAMEBUFFER: u32 = 1 << 12;
 const MULTIBOOT_FRAMEBUFFER_RGB: u8 = 1;
 const MAX_BACKBUFFER_PIXELS: usize = 1024 * 1024;
+/// Central palette for the polished charcoal-and-steel Horizon desktop.
+///
+/// Each value uses the renderer's `0xRRGGBBAA` convention. Keep the ice-blue
+/// accent limited to selected/focused indicators; ordinary surfaces, controls,
+/// and text use the neutral slate tokens.
+///
+/// NOTE: Brand Styling: customize palette values in [`THEME`] rather than
+/// introducing local color literals in individual widgets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Theme {
+    /// Deep charcoal canvas shown behind the windows.
+    ///
+    /// NOTE: Brand Styling: this is the lowest-contrast foundation token.
+    pub background_canvas: u32,
+    /// Muted dark steel-gray title bar for the focused window.
+    ///
+    /// NOTE: Brand Styling: its partial alpha preserves subtle wallpaper depth.
+    pub window_bar_active: u32,
+    /// Off-black slate title bar for unfocused windows.
+    ///
+    /// NOTE: Brand Styling: keep inactive chrome quieter than the active bar.
+    pub window_bar_inactive: u32,
+    /// Ice Blue `#4A90E2` used only for active focus/selection indicators.
+    ///
+    /// NOTE: Brand Styling: reserve this token for deliberate interaction
+    /// feedback rather than large surfaces or decorative text.
+    pub accent_highlight: u32,
+    /// Primary off-white text color for dark surfaces.
+    ///
+    /// NOTE: Brand Styling: maintain readable contrast against slate surfaces.
+    pub text_primary: u32,
+    /// Secondary neutral text color for supporting information.
+    ///
+    /// NOTE: Brand Styling: use a lower contrast than `text_primary`.
+    pub text_secondary: u32,
+    /// Thin steel-gray strokes for idle borders and wireframes.
+    ///
+    /// NOTE: Brand Styling: use the accent instead only while a component is active.
+    pub border_subtle: u32,
+    /// Opaque elevated slate surface for content and standard windows.
+    ///
+    /// NOTE: Brand Styling: separate surfaces with luminance, not extra accents.
+    pub surface_window: u32,
+    /// Translucent dark steel surface for the Start Menu panel.
+    ///
+    /// NOTE: Brand Styling: tune alpha to balance glass effect and legibility.
+    pub surface_glass: u32,
+    /// Quiet neutral surface for idle window controls and taskbar tabs.
+    ///
+    /// NOTE: Brand Styling: keep control chrome subordinate to window content.
+    pub control_neutral: u32,
+    /// Muted red reserved for the destructive close control and errors.
+    ///
+    /// NOTE: Brand Styling: keep destructive feedback distinct but restrained.
+    pub destructive_muted: u32,
+    /// Restrained success feedback color.
+    ///
+    /// NOTE: Brand Styling: avoid using success status as a general accent.
+    pub status_success: u32,
+    /// Restrained error feedback color.
+    ///
+    /// NOTE: Brand Styling: reserve this token for errors and validation state.
+    pub status_error: u32,
+}
+
+/// Default dark corporate palette shared by the graphics and window layers.
+///
+/// NOTE: Brand Styling: edit this single initializer to retheme all components
+/// that consume the global theme lookup.
+pub const THEME: Theme = Theme {
+    background_canvas: 0x0e141cff,
+    window_bar_active: 0x46515fde,
+    window_bar_inactive: 0x131a23ff,
+    accent_highlight: 0x4a90e2ff,
+    text_primary: 0xe7ebf0ff,
+    text_secondary: 0xaeb8c4ff,
+    border_subtle: 0x394553ff,
+    surface_window: 0x161f2aff,
+    surface_glass: 0x171f2bdd,
+    control_neutral: 0x2a3440ff,
+    destructive_muted: 0x9c5e62ff,
+    status_success: 0xa8bacaff,
+    status_error: 0xb9797fff,
+};
+
+const MAX_SHADOW_BLUR: usize = 32;
 const CURSOR_WIDTH: usize = 12;
 const CURSOR_HEIGHT: usize = 18;
 const CURSOR_PIXELS: usize = CURSOR_WIDTH * CURSOR_HEIGHT;
@@ -185,6 +278,144 @@ pub fn draw_rectangle(
     Ok(())
 }
 
+/// Draws a clipped, anti-aliased rounded rectangle into the back buffer.
+///
+/// `x` and `y` are the upper-left pixel coordinates; `width` and `height` are
+/// extents; `radius` is clamped to half the shorter edge; and `color` is
+/// `0xRRGGBBAA`. Edge coverage scales the source alpha and is composited over
+/// the current back-buffer pixel. Returns an error if graphics is unavailable.
+///
+/// NOTE: Design Customization: change radius and the one-pixel coverage ramp
+/// together to establish a consistent corner style across desktop controls.
+pub fn draw_rounded_rectangle(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    radius: usize,
+    color: u32,
+) -> Result<(), &'static str> {
+    let framebuffer = current_framebuffer()?;
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let right = x.saturating_add(width);
+    let bottom = y.saturating_add(height);
+    let left = x.saturating_sub(1).min(framebuffer.width);
+    let top = y.saturating_sub(1).min(framebuffer.height);
+    let right = right.saturating_add(1).min(framebuffer.width);
+    let bottom = bottom.saturating_add(1).min(framebuffer.height);
+    let radius = radius.min(width.min(height) / 2);
+
+    for pixel_y in top..bottom {
+        for pixel_x in left..right {
+            let coverage =
+                rounded_rectangle_coverage(pixel_x, pixel_y, x, y, width, height, radius);
+            if coverage == 0 {
+                continue;
+            }
+            let alpha = ((color & 0xff) * u32::from(coverage) + 1) / 2;
+            let covered_color = (color & !0xff) | alpha;
+            put_pixel_in(&framebuffer, pixel_x, pixel_y, covered_color)?;
+        }
+    }
+    Ok(())
+}
+
+/// Draws a soft dark shadow behind a window or floating panel.
+///
+/// `offset` shifts the shadow down and right from the source bounds. The
+/// `blur_strength` controls the number of progressively softer rounded layers
+/// and is capped to bound per-frame work. Returns an error if graphics is not
+/// initialized.
+///
+/// NOTE: Design Customization: tune the base opacity, blur cap, and offset to
+/// match the visual depth of each window class.
+pub fn draw_drop_shadow(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    offset: usize,
+    blur_strength: usize,
+) -> Result<(), &'static str> {
+    let framebuffer = current_framebuffer()?;
+    let blur = blur_strength.min(MAX_SHADOW_BLUR);
+    if width == 0 || height == 0 || blur == 0 {
+        return Ok(());
+    }
+    let shadow_x = x.saturating_add(offset);
+    let shadow_y = y.saturating_add(offset);
+    let original_right = shadow_x.saturating_add(width);
+    let original_bottom = shadow_y.saturating_add(height);
+    for spread in (1..=blur).rev() {
+        let alpha = (64 * (blur - spread + 1) / (blur + 1)) as u32;
+        let shape_x = shadow_x.saturating_sub(spread);
+        let shape_y = shadow_y.saturating_sub(spread);
+        let shape_width = width.saturating_add(spread.saturating_mul(2));
+        let shape_height = height.saturating_add(spread.saturating_mul(2));
+        let left = shape_x.saturating_sub(1).min(framebuffer.width);
+        let top = shape_y.saturating_sub(1).min(framebuffer.height);
+        let right = shape_x
+            .saturating_add(shape_width)
+            .saturating_add(1)
+            .min(framebuffer.width);
+        let bottom = shape_y
+            .saturating_add(shape_height)
+            .saturating_add(1)
+            .min(framebuffer.height);
+        // The window surface is painted after its shadow, so avoid blending
+        // shadow pixels inside the source rectangle and visit only its border.
+        for pixel_y in top..bottom {
+            let inside_vertical_span = pixel_y >= shadow_y && pixel_y < original_bottom;
+            for pixel_x in left..right {
+                if inside_vertical_span && pixel_x >= shadow_x && pixel_x < original_right {
+                    continue;
+                }
+                let coverage = rounded_rectangle_coverage(
+                    pixel_x,
+                    pixel_y,
+                    shape_x,
+                    shape_y,
+                    shape_width,
+                    shape_height,
+                    spread.saturating_add(8),
+                );
+                if coverage == 0 {
+                    continue;
+                }
+                let covered_alpha = (alpha * u32::from(coverage) + 1) / 2;
+                put_pixel_in(&framebuffer, pixel_x, pixel_y, 0x03070b00 | covered_alpha)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns the source-over blend of two `0xRRGGBBAA` pixels.
+///
+/// The source alpha selects the contribution of the source RGB; destination
+/// alpha is preserved as fully opaque because the framebuffer is an opaque
+/// display surface. Alpha zero returns the destination RGB and alpha 255
+/// returns the source RGB.
+///
+/// NOTE: Design Customization: this is the shared color-mixing equation for
+/// translucent panels, title bars, rounded edges, and drop shadows.
+pub const fn blend_rgba(source: u32, destination: u32) -> u32 {
+    let alpha = source & 0xff;
+    let inverse_alpha = 255 - alpha;
+    let red = (((source >> 24 & 0xff) * alpha + (destination >> 24 & 0xff) * inverse_alpha + 127)
+        / 255)
+        << 24;
+    let green =
+        (((source >> 16 & 0xff) * alpha + (destination >> 16 & 0xff) * inverse_alpha + 127) / 255)
+            << 16;
+    let blue = (((source >> 8 & 0xff) * alpha + (destination >> 8 & 0xff) * inverse_alpha + 127)
+        / 255)
+        << 8;
+    red | green | blue | 0xff
+}
+
 /// Copies a source pixel buffer into the clipped back-buffer region.
 ///
 /// `buffer_width`/`buffer_height` describe `pixels`; `clip_width`/`clip_height`
@@ -231,17 +462,37 @@ pub fn draw_buffer(
 /// carriage returns, and tabs are handled; drawing stops at the screen edge.
 /// Returns an error if graphics is uninitialized.
 pub fn draw_string(x: usize, y: usize, text: &str, color: u32) -> Result<(), &'static str> {
+    draw_string_signed(
+        x.min(i32::MAX as usize) as i32,
+        y.min(i32::MAX as usize) as i32,
+        text,
+        color,
+    )
+}
+
+/// Draws ASCII text at signed framebuffer coordinates, clipping negative origins.
+///
+/// Windows GDI uses signed client coordinates, while the native framebuffer
+/// API uses unsigned pixel offsets. This bridge retains the glyph's original
+/// position and clips individual pixels outside the top or left framebuffer
+/// edges instead of wrapping negative coordinates into large `usize` values.
+pub(crate) fn draw_string_signed(
+    x: i32,
+    y: i32,
+    text: &str,
+    color: u32,
+) -> Result<(), &'static str> {
     let framebuffer = current_framebuffer()?;
-    let origin_x = x;
-    let mut cursor_x = x;
-    let mut cursor_y = y;
+    let origin_x = i64::from(x);
+    let mut cursor_x = origin_x;
+    let mut cursor_y = i64::from(y);
 
     for byte in text.bytes() {
         match byte {
             b'\n' => {
                 cursor_x = origin_x;
                 cursor_y = cursor_y.saturating_add(8);
-                if cursor_y >= framebuffer.height {
+                if cursor_y >= framebuffer.height as i64 {
                     break;
                 }
                 continue;
@@ -254,7 +505,7 @@ pub fn draw_string(x: usize, y: usize, text: &str, color: u32) -> Result<(), &'s
             _ => {}
         }
 
-        if cursor_x >= framebuffer.width || cursor_y >= framebuffer.height {
+        if cursor_x >= framebuffer.width as i64 || cursor_y >= framebuffer.height as i64 {
             break;
         }
         let glyph_index = if byte.is_ascii() {
@@ -263,17 +514,21 @@ pub fn draw_string(x: usize, y: usize, text: &str, color: u32) -> Result<(), &'s
             b'?' as usize
         };
         for (row, bits) in FONT8X8_BASIC[glyph_index].iter().copied().enumerate() {
-            let pixel_y = cursor_y.saturating_add(row);
-            if pixel_y >= framebuffer.height {
+            let pixel_y = cursor_y.saturating_add(row as i64);
+            if pixel_y >= framebuffer.height as i64 {
                 break;
             }
             for column in 0..8 {
                 if bits & (1 << column) == 0 {
                     continue;
                 }
-                let pixel_x = cursor_x.saturating_add(column);
-                if pixel_x < framebuffer.width {
-                    put_pixel_in(&framebuffer, pixel_x, pixel_y, color)?;
+                let pixel_x = cursor_x.saturating_add(column as i64);
+                if pixel_x >= 0
+                    && pixel_y >= 0
+                    && pixel_x < framebuffer.width as i64
+                    && pixel_y < framebuffer.height as i64
+                {
+                    put_pixel_in(&framebuffer, pixel_x as usize, pixel_y as usize, color)?;
                 }
             }
         }
@@ -306,9 +561,9 @@ pub fn draw_cursor(x: usize, y: usize, buttons: u8) -> Result<(), &'static str> 
         save_cursor(&framebuffer, left, top, width, height);
 
         let foreground = if buttons & 1 != 0 {
-            0xffd166ff
+            THEME.accent_highlight
         } else {
-            0xffffffff
+            THEME.text_primary
         };
         let black = pack_color(0x000000ff, &framebuffer);
         let white = pack_color(foreground, &framebuffer);
@@ -404,13 +659,8 @@ fn put_pixel_in(
         pack_color(color, framebuffer)
     } else {
         let (old_red, old_green, old_blue) = unpack_color(old, framebuffer);
-        pack_color(
-            (blend_channel((color >> 24) & 0xff, old_red, alpha) << 24)
-                | (blend_channel((color >> 16) & 0xff, old_green, alpha) << 16)
-                | (blend_channel((color >> 8) & 0xff, old_blue, alpha) << 8)
-                | 0xff,
-            framebuffer,
-        )
+        let destination = (old_red << 24) | (old_green << 16) | (old_blue << 8) | 0xff;
+        pack_color(blend_rgba(color, destination), framebuffer)
     };
     unsafe {
         pixel.write(packed);
@@ -443,8 +693,130 @@ fn pack_channel(value: u32, channel: Channel) -> u32 {
     ((value * maximum + 127) / 255) << channel.position
 }
 
-fn blend_channel(source: u32, destination: u32, alpha: u32) -> u32 {
-    (source * alpha + destination * (255 - alpha) + 127) / 255
+/// Calculates rounded-box edge coverage in half-pixel increments.
+///
+/// Coordinates are pixel indices and geometry uses the rectangle's exclusive
+/// right/bottom bounds. The signed-distance calculation keeps corner behavior
+/// consistent for every radius while integer square root avoids floating-point
+/// runtime dependencies in the freestanding kernel.
+///
+/// NOTE: Design Customization: adjust the final one-pixel antialias ramp in
+/// `draw_rounded_rectangle` if a sharper or softer edge is desired.
+fn rounded_rectangle_coverage(
+    pixel_x: usize,
+    pixel_y: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    radius: usize,
+) -> u8 {
+    let radius = radius.min(width.min(height) / 2);
+    if radius == 0 {
+        return u8::from(
+            pixel_x >= x
+                && pixel_y >= y
+                && pixel_x < x.saturating_add(width)
+                && pixel_y < y.saturating_add(height),
+        ) * 2;
+    }
+    let point_x = (pixel_x as i64 - x as i64) * 2 + 1;
+    let point_y = (pixel_y as i64 - y as i64) * 2 + 1;
+    let width = width as i64 * 2;
+    let height = height as i64 * 2;
+    let radius = radius as i64 * 2;
+    let qx = (point_x - width / 2).abs() - (width / 2 - radius);
+    let qy = (point_y - height / 2).abs() - (height / 2 - radius);
+    let outside_x = qx.max(0) as u64;
+    let outside_y = qy.max(0) as u64;
+    let outside_distance = integer_sqrt(
+        outside_x
+            .saturating_mul(outside_x)
+            .saturating_add(outside_y.saturating_mul(outside_y)),
+    ) as i64;
+    let signed_distance = outside_distance + qx.max(qy).min(0) - radius;
+    (1 - signed_distance).clamp(0, 2) as u8
+}
+
+/// Computes a floor integer square root without relying on libm.
+///
+/// NOTE: Design Customization: replace this with a measured architecture-
+/// specific primitive only if rounded edges become a significant render cost.
+const fn integer_sqrt(value: u64) -> u64 {
+    let mut result = 0u64;
+    let mut bit = 1u64 << 62;
+    while bit > value {
+        bit >>= 2;
+    }
+    let mut remainder = value;
+    while bit != 0 {
+        if remainder >= result + bit {
+            remainder -= result + bit;
+            result = (result >> 1) + bit;
+        } else {
+            result >>= 1;
+        }
+        bit >>= 2;
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    /// Verifies that the default palette keeps the requested restrained brand tokens.
+    ///
+    /// NOTE: Brand Styling: preserve these assertions when tuning visual
+    /// values so Ice Blue stays exact and large surfaces remain neutral.
+    #[test]
+    fn default_theme_uses_corporate_neutral_palette() {
+        assert_eq!(super::THEME.accent_highlight, 0x4a90e2ff);
+        assert_eq!(super::THEME.background_canvas, 0x0e141cff);
+        assert_eq!(super::THEME.window_bar_active & 0xff, 0xde);
+        assert_eq!(super::THEME.window_bar_inactive & 0xff, 0xff);
+        assert_ne!(
+            super::THEME.window_bar_active,
+            super::THEME.accent_highlight
+        );
+        assert_ne!(
+            super::THEME.window_bar_inactive,
+            super::THEME.accent_highlight
+        );
+    }
+
+    /// Verifies the color mixer preserves both endpoint colors exactly.
+    ///
+    /// NOTE: Design Customization: retain these endpoint checks when changing
+    /// the theme mixer or framebuffer alpha conventions.
+    #[test]
+    fn alpha_blending_obeys_transparent_and_opaque_endpoints() {
+        assert_eq!(super::blend_rgba(0xff000000, 0x12345678), 0x123456ff);
+        assert_eq!(super::blend_rgba(0xff000080, 0x000000ff), 0x800000ff);
+        assert_eq!(super::blend_rgba(0xff0000ff, 0x12345678), 0xff0000ff);
+    }
+
+    /// Verifies corner pixels fade smoothly and the rounded-box center is solid.
+    ///
+    /// NOTE: Design Customization: update expectations only when intentionally
+    /// changing the geometric coverage ramp.
+    #[test]
+    fn rounded_rectangle_coverage_fades_at_corners() {
+        let corner = super::rounded_rectangle_coverage(0, 0, 0, 0, 12, 12, 4);
+        let edge = super::rounded_rectangle_coverage(5, 0, 0, 0, 12, 12, 4);
+        let center = super::rounded_rectangle_coverage(6, 6, 0, 0, 12, 12, 4);
+        assert!(corner < edge);
+        assert_eq!(center, 2);
+    }
+
+    /// Verifies the freestanding square-root helper around exact squares.
+    ///
+    /// NOTE: Design Customization: preserve floor semantics expected by the
+    /// signed-distance antialias calculation.
+    #[test]
+    fn integer_square_root_rounds_down() {
+        assert_eq!(super::integer_sqrt(0), 0);
+        assert_eq!(super::integer_sqrt(15), 3);
+        assert_eq!(super::integer_sqrt(16), 4);
+    }
 }
 
 unsafe fn save_cursor(framebuffer: &Framebuffer, x: usize, y: usize, width: usize, height: usize) {

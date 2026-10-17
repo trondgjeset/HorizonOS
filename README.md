@@ -35,7 +35,78 @@ The AI-assisted initialization phase has successfully deployed a functional, boo
 * **Preemptive Multi-tasking:** A core scheduler governing Ring 0 (kernel space) and Ring 3 (isolated user space) tasks via PIT timer ticks (10ms time slices).
 * **Interactive GUI Shell:** A double-buffered rendering pipeline tracking live mouse cursor coordinates, window objects, dragging mechanics, a functional Start Menu panel overlay, and embedded bitmap typography.
 * **Dynamic Memory Allocator:** A thread-safe global kernel Heap Allocator unlocking native Rust dynamic collections (`Vec`, `String`).
-* **Virtual Storage Drive:** A simulated read-only `C:\` drive running via an integrated RAM disk layout.
+* **Virtual Storage Drive:** A read-only initrd-backed `C:\` drive with a bounded, volatile heap overlay for native shell writes.
+
+### Win32 graphics prototype
+
+The desktop renderer uses a centralized charcoal-slate `Theme` palette with
+off-white text and muted steel title bars. Ice Blue (`#4A90E2`) is reserved for
+active indicators such as the Start button and focused editor field; idle
+controls and taskbar tabs use subtle neutral borders. Window frames, launcher
+rows, tabs, and editor controls use integer-distance anti-aliased rounded
+corners; floating windows and the Start Menu receive layered alpha-blended
+shadows. The Start Menu and title bars are composited over the double buffer
+using source-over RGBA pixel blending; the compositor then flushes the
+completed back buffer to the linear framebuffer. Customize the shared palette
+and pixel math in `src/graphics.rs`.
+
+To preview the theme, build and run the emulator with `make run`.
+
+The desktop also loads a generated 24-bit BMP from
+`C:\Windows\System\wallpaper.bmp` in the initrd and scales it to the framebuffer
+before composing windows. The BMP decoder accepts bounded, uncompressed 24-bit
+and 32-bit `BI_RGB` files and rejects truncated or unsupported images. Click the
+editor's rounded input field to focus it, type text, and use Backspace to edit;
+the caret blinks while the field has focus. Keyboard IRQ code only queues
+translated ASCII—the desktop task mutates the allocated string outside interrupt
+context.
+
+The left desktop column contains evenly spaced This PC, User Folder, and
+Recycle Bin shortcuts with centered labels and geometric theme-colored
+silhouettes. Select an icon with one click to show a translucent Ice Blue
+boundary, then open it with a second click on the same icon within 450 ms: This
+PC lists the mounted `C:\` volume and an unmounted `D:\` placeholder, while the
+other shortcuts open the user's Documents directory and the sandbox
+`C:\System\Trash` directory. The icons are composited above the wallpaper and
+behind application windows.
+
+The Start Menu's **Run Win32 Demo** option opens a normal Horizon window and
+draws through the experimental `TextOutA` and `FillRect` GDI-shaped kernel
+hooks. To try it, build and start the emulator with `make run`, open Start, and
+select **Run Win32 Demo**.
+
+The **Launch External App** option reads the data-only PE32 fixture at
+`C:\Apps\TEST.EXE` from the read-only RAM disk. It validates the headers,
+copies section bytes into an RVA-layout staging buffer, and classifies a small
+set of GDI imports. The primary window reports the image base, entry RVA, size,
+and sections; it does **not** execute the fixture.
+
+The desktop starts with no application window open. Select **System Utility**
+from the Start Menu to allocate and open the editor on demand. It includes the
+shared-page calculator task counter, a small text input field, and a **Save
+File** button. The isolated Ring 3 calculator context is prepared during boot
+but remains blocked until System Utility opens successfully. A click writes
+the entered bytes to `C:\Users\Default\Documents\notes.txt` in a bounded, heap-backed writable
+overlay; File Explorer lists the result and reads its latest contents. This
+overlay is volatile and is lost at reboot. The
+tar initrd remains unchanged; durable writes require a future journaled block
+storage backend.
+
+The `CreateFileA` and `WriteFile` C-ABI names currently fail closed and report
+`ERROR_ACCESS_DENIED` because no Ring 3 syscall dispatcher or safe guest-memory
+copy exists. The native Save button uses a separate fixed-path kernel capability;
+it is not proof of process-bound Win32 authorization or a guest file API.
+
+This is a native in-kernel rendering smoke test, not Windows application
+execution: there is no Win32 import dispatcher, guest-pointer marshalling,
+process-owned GDI context, dynamic per-process page-directory allocator,
+relocation/IAT patching, or dynamic scheduler registration. Import matches are
+metadata only and do not contain kernel function pointers. The Direct3D/Vulkan
+placeholders fail closed until those isolation and ABI facilities exist. Run
+`make test-graphics`, `make test-win32`, `make test-win32-loader`, and
+`make test-win32-file-api` to exercise rounded-edge/color math, hook coordinate
+conversion, PE staging, import classification, and the fail-closed file
+API/native save capability.
 
 ---
 
