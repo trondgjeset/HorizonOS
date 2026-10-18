@@ -1077,3 +1077,4 @@ mod tests {
         assert!(Archive::parse(&invalid_checksum).is_err());
     }
 }
+
